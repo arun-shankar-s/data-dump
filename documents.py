@@ -1,16 +1,24 @@
 import os
+import json
+import uuid
 from datetime import datetime, date
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, Form
 from fastapi.responses import FileResponse
 from sqlalchemy import select, func, and_
 from sqlalchemy.orm import Session
 
 from database import get_db
-from models import Document, Department, User
-from schemas import DocumentListResponse, DocumentRow, DepartmentOut, UserOut
+from models import Document, Department, User, UserGroup, DocumentPermission
+from schemas import DocumentListResponse, DocumentRow, DepartmentOut, UserOut, UserGroupOut
 
 router = APIRouter(prefix="/api", tags=["documents"])
+
+UPLOAD_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "uploads")
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+ALLOWED_EXTENSIONS = {".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx"}
+MAX_FILE_SIZE = 20 * 1024 * 1024  # 20MB
 
 
 @router.get("/documents", response_model=DocumentListResponse)
@@ -124,3 +132,72 @@ def list_departments(db: Session = Depends(get_db)):
 def list_users(db: Session = Depends(get_db)):
     rows = db.execute(select(User.user_id, User.username).order_by(User.username)).all()
     return [UserOut(user_id=r[0], username=r[1]) for r in rows]
+
+
+@router.get("/user-groups", response_model=list[UserGroupOut])
+def list_user_groups(db: Session = Depends(get_db)):
+    rows = db.execute(select(UserGroup.group_id, UserGroup.group_name).order_by(UserGroup.group_id)).all()
+    return [UserGroupOut(group_id=r[0], group_name=r[1]) for r in rows]
+
+
+@router.post("/documents/upload", status_code=201)
+async def upload_document(
+    document_name: str = Form(...),
+    department_id: int = Form(...),
+    uploaded_by: int = Form(...),
+    permissions: str = Form("[]"),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    # validate department + uploader exist
+    if not db.get(Department, department_id):
+        raise HTTPException(status_code=400, detail="Department not found")
+    if not db.get(User, uploaded_by):
+        raise HTTPException(status_code=400, detail="Uploader user not found")
+
+    # validate file type
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=400, detail=f"File type {ext} not allowed")
+
+    # validate file size
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(status_code=400, detail="File exceeds 20MB limit")
+
+    # save file to disk with a unique name (avoid collisions)
+    stored_name = f"{uuid.uuid4().hex}{ext}"
+    stored_path = os.path.join(UPLOAD_DIR, stored_name)
+    with open(stored_path, "wb") as f:
+        f.write(contents)
+
+    # insert document row
+    doc = Document(
+        document_name=document_name,
+        department_id=department_id,
+        file_name=file.filename,
+        file_path=stored_path,
+        uploaded_by=uploaded_by,
+        status="active",
+    )
+    db.add(doc)
+    db.flush()  # get doc.document_id before commit
+
+    # insert permission rows
+    try:
+        perm_list = json.loads(permissions)
+    except json.JSONDecodeError:
+        perm_list = []
+
+    for p in perm_list:
+        db.add(DocumentPermission(
+            document_id=doc.document_id,
+            group_id=p["group_id"],
+            can_view=p.get("can_view", True),
+            can_edit=p.get("can_edit", False),
+        ))
+
+    db.commit()
+    db.refresh(doc)
+
+    return {"status": "uploaded", "document_id": doc.document_id, "document_name": doc.document_name}
